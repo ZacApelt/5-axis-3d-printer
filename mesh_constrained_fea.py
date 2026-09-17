@@ -380,6 +380,8 @@ def ammend_nodes(nodes):
     connected_edge_pairs = []
     seen_pairs = set()
 
+    # Find all pairs of under-connected nodes that are already connected to each other.
+    # This is a more localised search than checking every pair of under-connected nodes.
     for node in nodes:
         for connected_node in node.connections:
             if node is connected_node:
@@ -399,34 +401,24 @@ def ammend_nodes(nodes):
                     (node, connected_node)
                 )
 
-    # Process shorter, more local edges first.
-    connected_edge_pairs.sort(
-        key=lambda pair: np.hypot(
-            pair[1].x - pair[0].x,
-            pair[1].y - pair[0].y,
-        )
-    )
 
     for node_a, node_b in connected_edge_pairs:
+        #if len(node_a.connections) >= 6 and len(node_b.connections) >= 6:
+        #    continue
+
         position_a = np.array([node_a.x, node_a.y])
         position_b = np.array([node_b.x, node_b.y])
 
         ab = position_b - position_a
         length = np.linalg.norm(ab)
 
-        if length < 1e-12 or length > 2 * hor_spacing:
+        if length < 1e-12: # or length > 2 * hor_spacing:
             continue
 
         midpoint = 0.5 * (position_a + position_b)
         normal = np.array([-ab[1], ab[0]]) / length
 
-        triangle_height = np.sqrt(
-            max(
-                0.0,
-                hor_spacing**2
-                - (length / 2.0)**2,
-            )
-        )
+        triangle_height = np.sqrt(max(0.0, hor_spacing**2 - (length / 2.0)**2))
 
         candidate_positions = [
             midpoint + triangle_height * normal,
@@ -434,10 +426,7 @@ def ammend_nodes(nodes):
         ]
 
         for candidate_position in candidate_positions:
-            if not is_in_geometry(
-                candidate_position[0],
-                candidate_position[1],
-            ):
+            if not is_in_geometry(candidate_position[0], candidate_position[1]):
                 continue
 
             # Find the closest existing node to this triangle vertex.
@@ -445,13 +434,7 @@ def ammend_nodes(nodes):
             closest_distance = np.inf
 
             for existing_node in nodes:
-                distance = np.linalg.norm(
-                    candidate_position
-                    - np.array([
-                        existing_node.x,
-                        existing_node.y,
-                    ])
-                )
+                distance = np.linalg.norm(candidate_position - np.array([existing_node.x, existing_node.y]))
 
                 if distance < closest_distance:
                     closest_distance = distance
@@ -471,6 +454,7 @@ def ammend_nodes(nodes):
             # These are the only connections implied by this triangle.
             connect(triangle_node, node_a)
             connect(triangle_node, node_b)
+
 
     # Remove nodes outside the original geometry.
     nodes_to_remove = {
@@ -593,32 +577,32 @@ for load_step in range(1, number_of_load_steps + 1 , 1):
                 f"{max_amendment_passes} passes."
             )
 
-    print(f"Amendment passes: {amendment_passes}")
+    #print(f"Amendment passes: {amendment_passes}")
 
 
-    plt.figure(figsize=(8, 8))
+        plt.figure(figsize=(8, 8))
 
-    # plot the geometry boundary
-    plt.plot([0, minor_width, minor_width, major_width, major_width, 0, 0], [0, 0, mid_height, mid_height, height, height, 0], "k-", linewidth=2)
+        # plot the geometry boundary
+        plt.plot([0, minor_width, minor_width, major_width, major_width, 0, 0], [0, 0, mid_height, mid_height, height, height, 0], "k-", linewidth=2)
 
-    # Deformed mesh
-    for spring in springs:
-        plt.plot(
-            [spring.node_a.x, spring.node_b.x],
-            [spring.node_a.y, spring.node_b.y],
-            "k-",
-            linewidth=1,
-        )
+        # Deformed mesh
+        for spring in springs:
+            plt.plot(
+                [spring.node_a.x, spring.node_b.x],
+                [spring.node_a.y, spring.node_b.y],
+                "k-",
+                linewidth=1,
+            )
 
-    for node in nodes:
-        colour = "red" if node.fixed else "blue"
-        plt.plot(node.x, node.y, "o", color=colour)
+        for node in nodes:
+            colour = "red" if node.fixed else "blue"
+            plt.plot(node.x, node.y, "o", color=colour)
 
-        # plot the force vector as a red arrow
-        if np.linalg.norm(node.F) > 0:
-            plt.arrow(node.x, node.y, node.F[0] * 3, node.F[1] * 3, color="r", head_width=0.5)
+            # plot the force vector as a red arrow
+            if np.linalg.norm(node.F) > 0:
+                plt.arrow(node.x, node.y, node.F[0] * 3, node.F[1] * 3, color="r", head_width=0.5)
 
-    plt.axis("equal")
-    plt.xlabel("x")
-    plt.ylabel("y")
-    plt.show()
+        plt.axis("equal")
+        plt.xlabel("x")
+        plt.ylabel("y")
+        plt.show()
