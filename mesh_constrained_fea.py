@@ -277,104 +277,251 @@ def solve_single_step(nodes, springs, force_scale=1.0, relaxation=1.0, max_node_
         "converged": relative_residual < 1e-8,
     }
 
+def segments_cross(node_a, node_b, node_c, node_d, tolerance=1e-9):
+    """
+    Return True if AB and CD properly cross.
+
+    Connections sharing a node are allowed.
+    """
+    if (
+        node_a is node_c
+        or node_a is node_d
+        or node_b is node_c
+        or node_b is node_d
+    ):
+        return False
+
+    a = np.array([node_a.x, node_a.y])
+    b = np.array([node_b.x, node_b.y])
+    c = np.array([node_c.x, node_c.y])
+    d = np.array([node_d.x, node_d.y])
+
+    def orientation(p, q, r):
+        return (
+            (q[0] - p[0]) * (r[1] - p[1])
+            - (q[1] - p[1]) * (r[0] - p[0])
+        )
+
+    o1 = orientation(a, b, c)
+    o2 = orientation(a, b, d)
+    o3 = orientation(c, d, a)
+    o4 = orientation(c, d, b)
+
+    return (
+        (
+            (o1 > tolerance and o2 < -tolerance)
+            or (o1 < -tolerance and o2 > tolerance)
+        )
+        and
+        (
+            (o3 > tolerance and o4 < -tolerance)
+            or (o3 < -tolerance and o4 > tolerance)
+        )
+    )
+
+
+def connection_would_cross(node_a, node_b, nodes):
+    """Check a proposed connection against every existing connection."""
+    checked_edges = set()
+
+    for existing_a in nodes:
+        for existing_b in existing_a.connections:
+            edge_key = frozenset((existing_a, existing_b))
+
+            if edge_key in checked_edges:
+                continue
+
+            checked_edges.add(edge_key)
+
+            if segments_cross(
+                node_a,
+                node_b,
+                existing_a,
+                existing_b,
+            ):
+                return True
+
+    return False
 
 def ammend_nodes(nodes):
     original_node_set = set(nodes)
+    connections_changed = False
 
-    # Use a snapshot because connections are extended while new nodes are added.
-    edge_nodes = [node for node in nodes if len(node.connections) < 6]
+    def connect(node_a, node_b):
+        nonlocal connections_changed
+
+        if node_a is node_b:
+            return False
+
+        if node_b in node_a.connections:
+            return False
+
+        if connection_would_cross(node_a, node_b, nodes):
+            return False
+
+        node_a.connections.append(node_b)
+        node_b.connections.append(node_a)
+
+        connections_changed = True
+        return True
+
+    # Make the original directed connection lists symmetric.
+    for node in list(nodes):
+        for connected_node in list(node.connections):
+            if node not in connected_node.connections:
+                connected_node.connections.append(node)
+                connections_changed = True
+
+    edge_nodes = {
+        node for node in nodes
+        if len(node.connections) < 6
+    }
 
     connected_edge_pairs = []
     seen_pairs = set()
-    for node in edge_nodes:
+
+    for node in nodes:
         for connected_node in node.connections:
+            if node is connected_node:
+                continue
+
             pair_key = frozenset((node, connected_node))
-            if connected_node in edge_nodes and node is not connected_node and pair_key not in seen_pairs:
-                connected_edge_pairs.append((node, connected_node))
-                seen_pairs.add(pair_key)
+
+            if pair_key in seen_pairs:
+                continue
+
+            seen_pairs.add(pair_key)
+
+            # Only one endpoint needs to be under-connected. Requiring both
+            # can prevent valid missing triangles from being considered.
+            if node in edge_nodes or connected_node in edge_nodes:
+                connected_edge_pairs.append(
+                    (node, connected_node)
+                )
+
+    # Process shorter, more local edges first.
+    connected_edge_pairs.sort(
+        key=lambda pair: np.hypot(
+            pair[1].x - pair[0].x,
+            pair[1].y - pair[0].y,
+        )
+    )
 
     for node_a, node_b in connected_edge_pairs:
-        n_b = np.array([node_b.x, node_b.y])
-        n_a = np.array([node_a.x, node_a.y])
-        ab = n_b - n_a
+        position_a = np.array([node_a.x, node_a.y])
+        position_b = np.array([node_b.x, node_b.y])
+
+        ab = position_b - position_a
         length = np.linalg.norm(ab)
+
         if length < 1e-12 or length > 2 * hor_spacing:
             continue
 
-        midpoint = (n_a + n_b) / 2
+        midpoint = 0.5 * (position_a + position_b)
         normal = np.array([-ab[1], ab[0]]) / length
-        height = np.sqrt(max(0.0, hor_spacing**2 - (length / 2) ** 2))
-        positive_node_d = midpoint + height * normal
-        negative_node_d = midpoint - height * normal
 
-        # check if the positive node is already present
-        for node_d in [positive_node_d, negative_node_d]:
+        triangle_height = np.sqrt(
+            max(
+                0.0,
+                hor_spacing**2
+                - (length / 2.0)**2,
+            )
+        )
+
+        candidate_positions = [
+            midpoint + triangle_height * normal,
+            midpoint - triangle_height * normal,
+        ]
+
+        for candidate_position in candidate_positions:
+            if not is_in_geometry(
+                candidate_position[0],
+                candidate_position[1],
+            ):
+                continue
+
+            # Find the closest existing node to this triangle vertex.
+            closest_node = None
+            closest_distance = np.inf
+
             for existing_node in nodes:
-                existing_position = np.array([existing_node.x, existing_node.y])
-                if np.linalg.norm(node_d - existing_position) < hor_spacing / 2:
-                    break
+                distance = np.linalg.norm(
+                    candidate_position
+                    - np.array([
+                        existing_node.x,
+                        existing_node.y,
+                    ])
+                )
+
+                if distance < closest_distance:
+                    closest_distance = distance
+                    closest_node = existing_node
+
+            if closest_distance < hor_spacing / 2:
+                triangle_node = closest_node
 
             else:
-                if is_in_geometry(node_d[0], node_d[1]):
-                    new_node = Node(node_d[0], node_d[1])
-                    nodes.append(new_node)
+                # The triangle vertex is vacant.
+                triangle_node = Node(
+                    candidate_position[0],
+                    candidate_position[1],
+                )
+                nodes.append(triangle_node)
 
-                    def connect(first, second):
-                        if first is second:
-                            return
-                        if second not in first.connections:
-                            first.connections.append(second)
-                        if first not in second.connections:
-                            second.connections.append(first)
+            # These are the only connections implied by this triangle.
+            connect(triangle_node, node_a)
+            connect(triangle_node, node_b)
 
-                    connect(new_node, node_a)
-                    connect(new_node, node_b)
-
-                    # Snapshot the old neighbors so the new node cannot connect to itself.
-                    candidate_nodes = set(node_a.connections + node_b.connections)
-                    candidate_nodes.discard(new_node)
-                    candidate_nodes.discard(node_a)
-                    candidate_nodes.discard(node_b)
-                    for connected_node in candidate_nodes:
-                        connected_position = np.array([connected_node.x, connected_node.y])
-                        if np.linalg.norm(node_d - connected_position) < hor_spacing * 1.5:
-                            connect(new_node, connected_node)
-
-    # remove nodes that are outside the boundary of the original shape
+    # Remove nodes outside the original geometry.
     nodes_to_remove = {
-        node for node in edge_nodes
-        if not is_in_geometry(node.x, node.y)
+        node for node in nodes
+        if (
+            not node.fixed
+            and not is_in_geometry(node.x, node.y)
+        )
     }
-    if nodes_to_remove:
-        nodes[:] = [node for node in nodes if node not in nodes_to_remove]
-        remaining_nodes = set(nodes)
-        for node in nodes:
-            node.connections[:] = [
-                connected_node
-                for connected_node in node.connections
-                if connected_node is not node and connected_node in remaining_nodes
-            ]
 
-    # Remove any duplicate links left by the original directed mesh and amendments.
+    if nodes_to_remove:
+        nodes[:] = [
+            node for node in nodes
+            if node not in nodes_to_remove
+        ]
+        connections_changed = True
+
+    remaining_nodes = set(nodes)
+
+    # Remove deleted references, self-links and duplicates.
     for node in nodes:
-        node.connections[:] = list(dict.fromkeys(
+        cleaned_connections = list(dict.fromkeys(
             connected_node
             for connected_node in node.connections
-            if connected_node is not node and connected_node in nodes
+            if (
+                connected_node is not node
+                and connected_node in remaining_nodes
+            )
         ))
 
-    # reapply forces to the nodes in the widened section
-    # find the nodes that are vertically within vert_spacing of the udl line
-    for node in nodes:
-        if node.y >= mid_height - vert_spacing and node.y <= mid_height + vert_spacing:
-            if node.x > minor_width:
-                node.F = np.array([0, -1])  # add a downward force
-            else:
-                node.F = np.array([0, 0])  # remove any previous force
-        else:
-            node.F = np.array([0, 0])  # remove any previous force
+        if cleaned_connections != node.connections:
+            node.connections[:] = cleaned_connections
+            connections_changed = True
 
-    return set(nodes) != original_node_set
+    # Your existing load assignment.
+    for node in nodes:
+        if (
+            mid_height - vert_spacing
+            <= node.y
+            <= mid_height + vert_spacing
+            and node.x > minor_width
+        ):
+            node.F = np.array([0.0, -1.0])
+        else:
+            node.F = np.array([0.0, 0.0])
+
+    nodes_changed = set(nodes) != original_node_set
+
+    # Connection-only changes must cause another amendment pass because those
+    # new edges can reveal further missing triangles.
+    return nodes_changed or connections_changed
 
 
 def build_springs(nodes):
