@@ -304,37 +304,41 @@ def ammend_nodes(nodes):
         midpoint = (n_a + n_b) / 2
         normal = np.array([-ab[1], ab[0]]) / length
         height = np.sqrt(max(0.0, hor_spacing**2 - (length / 2) ** 2))
-        node_d = midpoint + height * normal
+        positive_node_d = midpoint + height * normal
+        negative_node_d = midpoint - height * normal
 
-        for existing_node in nodes:
-            existing_position = np.array([existing_node.x, existing_node.y])
-            if np.linalg.norm(node_d - existing_position) < hor_spacing / 2:
-                break
-        else:
-            if is_in_geometry(node_d[0], node_d[1]):
-                new_node = Node(node_d[0], node_d[1])
-                nodes.append(new_node)
+        # check if the positive node is already present
+        for node_d in [positive_node_d, negative_node_d]:
+            for existing_node in nodes:
+                existing_position = np.array([existing_node.x, existing_node.y])
+                if np.linalg.norm(node_d - existing_position) < hor_spacing / 2:
+                    break
 
-                def connect(first, second):
-                    if first is second:
-                        return
-                    if second not in first.connections:
-                        first.connections.append(second)
-                    if first not in second.connections:
-                        second.connections.append(first)
+            else:
+                if is_in_geometry(node_d[0], node_d[1]):
+                    new_node = Node(node_d[0], node_d[1])
+                    nodes.append(new_node)
 
-                connect(new_node, node_a)
-                connect(new_node, node_b)
+                    def connect(first, second):
+                        if first is second:
+                            return
+                        if second not in first.connections:
+                            first.connections.append(second)
+                        if first not in second.connections:
+                            second.connections.append(first)
 
-                # Snapshot the old neighbors so the new node cannot connect to itself.
-                candidate_nodes = set(node_a.connections + node_b.connections)
-                candidate_nodes.discard(new_node)
-                candidate_nodes.discard(node_a)
-                candidate_nodes.discard(node_b)
-                for connected_node in candidate_nodes:
-                    connected_position = np.array([connected_node.x, connected_node.y])
-                    if np.linalg.norm(node_d - connected_position) < hor_spacing * 1.5:
-                        connect(new_node, connected_node)
+                    connect(new_node, node_a)
+                    connect(new_node, node_b)
+
+                    # Snapshot the old neighbors so the new node cannot connect to itself.
+                    candidate_nodes = set(node_a.connections + node_b.connections)
+                    candidate_nodes.discard(new_node)
+                    candidate_nodes.discard(node_a)
+                    candidate_nodes.discard(node_b)
+                    for connected_node in candidate_nodes:
+                        connected_position = np.array([connected_node.x, connected_node.y])
+                        if np.linalg.norm(node_d - connected_position) < hor_spacing * 1.5:
+                            connect(new_node, connected_node)
 
     # remove nodes that are outside the boundary of the original shape
     nodes_to_remove = {
@@ -404,7 +408,7 @@ number_of_load_steps = 20
 for load_step in range(1, number_of_load_steps + 1 , 1):
     force_scale = load_step / number_of_load_steps
 
-    for iteration in range(20):
+    for iteration in range(50):
         result = solve_single_step(
             nodes,
             springs,
