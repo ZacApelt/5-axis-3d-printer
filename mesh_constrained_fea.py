@@ -80,6 +80,13 @@ for node in rows[0]:
 
 print(f"Number of nodes: {len(nodes)}")
 
+def is_in_geometry(x, y):
+    if 0 <= x <= major_width and 0 <= y <= height:
+        # within the bounding box, now check if it's within the shape
+        if y < mid_height and x > minor_width:
+            return False
+        return True
+    return False
 
 
 # plot the nodes
@@ -271,15 +278,155 @@ def solve_single_step(nodes, springs, force_scale=1.0, relaxation=1.0, max_node_
     }
 
 
+def ammend_nodes(nodes):
+    original_node_set = set(nodes)
+
+    def orientation(first, second, third):
+        return (
+            (second.x - first.x) * (third.y - first.y)
+            - (second.y - first.y) * (third.x - first.x)
+        )
+
+    def segments_cross(first, second, third, fourth):
+        first_orientation = orientation(first, second, third)
+        second_orientation = orientation(first, second, fourth)
+        third_orientation = orientation(third, fourth, first)
+        fourth_orientation = orientation(third, fourth, second)
+        epsilon = 1e-9
+
+        return (
+            first_orientation * second_orientation < -epsilon
+            and third_orientation * fourth_orientation < -epsilon
+        )
+
+    def connection_crosses(first, second, all_nodes):
+        for third in all_nodes:
+            for fourth in third.connections:
+                if third in (first, second) or fourth in (first, second):
+                    continue
+                if segments_cross(first, second, third, fourth):
+                    return True
+        return False
+
+    def connect(first, second):
+        if first is second or connection_crosses(first, second, nodes):
+            return False
+        if second not in first.connections:
+            first.connections.append(second)
+        if first not in second.connections:
+            second.connections.append(first)
+        return True
+
+    # Use a snapshot because connections are extended while new nodes are added.
+    edge_nodes = [node for node in nodes if len(node.connections) < 6]
+
+    connected_edge_pairs = []
+    seen_pairs = set()
+    for node in edge_nodes:
+        for connected_node in node.connections:
+            pair_key = frozenset((node, connected_node))
+            if connected_node in edge_nodes and node is not connected_node and pair_key not in seen_pairs:
+                connected_edge_pairs.append((node, connected_node))
+                seen_pairs.add(pair_key)
+
+    for node_a, node_b in connected_edge_pairs:
+        n_b = np.array([node_b.x, node_b.y])
+        n_a = np.array([node_a.x, node_a.y])
+        ab = n_b - n_a
+        length = np.linalg.norm(ab)
+        if length < 1e-12 or length > 2 * hor_spacing:
+            continue
+
+        midpoint = (n_a + n_b) / 2
+        normal = np.array([-ab[1], ab[0]]) / length
+        candidate_height = np.sqrt(max(0.0, hor_spacing**2 - (length / 2) ** 2))
+        candidate_points = (
+            midpoint + candidate_height * normal,
+            midpoint - candidate_height * normal,
+        )
+
+        for node_d in candidate_points:
+            if not is_in_geometry(node_d[0], node_d[1]):
+                continue
+
+            too_close = any(
+                np.linalg.norm(node_d - np.array([existing.x, existing.y]))
+                < hor_spacing * 0.35
+                for existing in nodes
+            )
+            if too_close:
+                continue
+
+            new_node = Node(node_d[0], node_d[1])
+            nodes.append(new_node)
+            connect(new_node, node_a)
+            connect(new_node, node_b)
+
+            # Only add local links that are short and do not cross an existing edge.
+            candidate_nodes = set(node_a.connections + node_b.connections)
+            candidate_nodes.discard(new_node)
+            candidate_nodes.discard(node_a)
+            candidate_nodes.discard(node_b)
+            for connected_node in candidate_nodes:
+                connected_position = np.array([connected_node.x, connected_node.y])
+                if np.linalg.norm(node_d - connected_position) <= hor_spacing * 1.1:
+                    connect(new_node, connected_node)
+
+    # remove nodes that are outside the boundary of the original shape
+    nodes_to_remove = {
+        node for node in edge_nodes
+        if not is_in_geometry(node.x, node.y)
+    }
+    if nodes_to_remove:
+        nodes[:] = [node for node in nodes if node not in nodes_to_remove]
+        remaining_nodes = set(nodes)
+        for node in nodes:
+            node.connections[:] = [
+                connected_node
+                for connected_node in node.connections
+                if connected_node is not node and connected_node in remaining_nodes
+            ]
+
+    # Remove any duplicate links left by the original directed mesh and amendments.
+    for node in nodes:
+        node.connections[:] = list(dict.fromkeys(
+            connected_node
+            for connected_node in node.connections
+            if connected_node is not node and connected_node in nodes
+        ))
+
+    # reapply forces to the nodes in the widened section
+    # find the nodes that are vertically within vert_spacing of the udl line
+    for node in nodes:
+        if node.y >= mid_height - vert_spacing and node.y <= mid_height + vert_spacing:
+            if node.x > minor_width:
+                node.F = np.array([0, -1])  # add a downward force
+            else:
+                node.F = np.array([0, 0])  # remove any previous force
+        else:
+            node.F = np.array([0, 0])  # remove any previous force
+
+    return set(nodes) != original_node_set
+
+
+def build_springs(nodes):
+    springs = []
+    seen_pairs = set()
+    for node in nodes:
+        for connected_node in node.connections:
+            if node is connected_node:
+                continue
+            pair_key = frozenset((node, connected_node))
+            if pair_key not in seen_pairs:
+                springs.append(Spring(node, connected_node, spring_stiffness))
+                seen_pairs.add(pair_key)
+    return springs
+
 
 # Create springs from the initial undeformed geometry
 spring_stiffness = 5.0
 
-springs = [
-    Spring(node, connected_node, spring_stiffness)
-    for node in nodes
-    for connected_node in node.connections
-]
+springs = build_springs(nodes)
 
 # Save original positions for plotting
 original_positions = {
@@ -290,7 +437,7 @@ original_positions = {
 # Gradually apply the node.F loads
 number_of_load_steps = 20
 
-for load_step in range(1, number_of_load_steps + 1 , 5):
+for load_step in range(1, number_of_load_steps + 1 , 1):
     force_scale = load_step / number_of_load_steps
 
     for iteration in range(20):
@@ -312,38 +459,51 @@ for load_step in range(1, number_of_load_steps + 1 , 5):
         f"residual={result['relative_residual']:.3e}"
     )
 
+    # Repeat amendment passes until the mesh reaches a stable node set.
+    amendment_passes = 0
+    max_amendment_passes = 20
+    while True:
+        amendment_passes += 1
+        nodes_changed = ammend_nodes(nodes)
+        springs = build_springs(nodes)
+        for node in nodes:
+            if node not in original_positions:
+                original_positions[node] = np.array([node.x, node.y])
 
-plt.figure(figsize=(8, 8))
+        if not nodes_changed:
+            break
+        if amendment_passes >= max_amendment_passes:
+            raise RuntimeError(
+                "Node amendment did not stabilize within "
+                f"{max_amendment_passes} passes."
+            )
 
-# Original mesh
-for spring in springs:
-    a = original_positions[spring.node_a]
-    b = original_positions[spring.node_b]
-
-    plt.plot(
-        [a[0], b[0]],
-        [a[1], b[1]],
-        color="0.8",
-        linewidth=1,
-        linestyle="--",
-    )
-
-# Deformed mesh
-for spring in springs:
-    plt.plot(
-        [spring.node_a.x, spring.node_b.x],
-        [spring.node_a.y, spring.node_b.y],
-        "k-",
-        linewidth=1,
-    )
-
-for node in nodes:
-    colour = "red" if node.fixed else "blue"
-    plt.plot(node.x, node.y, "o", color=colour)
-
-plt.axis("equal")
-plt.xlabel("x")
-plt.ylabel("y")
-plt.show()
+    print(f"Amendment passes: {amendment_passes}")
 
 
+    plt.figure(figsize=(8, 8))
+
+    # plot the geometry boundary
+    plt.plot([0, minor_width, minor_width, major_width, major_width, 0, 0], [0, 0, mid_height, mid_height, height, height, 0], "k-", linewidth=2)
+
+    # Deformed mesh
+    for spring in springs:
+        plt.plot(
+            [spring.node_a.x, spring.node_b.x],
+            [spring.node_a.y, spring.node_b.y],
+            "k-",
+            linewidth=1,
+        )
+
+    for node in nodes:
+        colour = "red" if node.fixed else "blue"
+        plt.plot(node.x, node.y, "o", color=colour)
+
+        # plot the force vector as a red arrow
+        if np.linalg.norm(node.F) > 0:
+            plt.arrow(node.x, node.y, node.F[0] * 3, node.F[1] * 3, color="r", head_width=0.5)
+
+    plt.axis("equal")
+    plt.xlabel("x")
+    plt.ylabel("y")
+    plt.show()
