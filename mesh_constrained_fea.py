@@ -12,9 +12,22 @@ class Node:
         self.connections = [] if connections is None else connections  # list of other nodes that this node is connected to
         self.F = np.array([0.0, 0.0])  # force vector
 
+class Spring:
+    def __init__(self, node_a, node_b, stiffness, rest_length=None):
+        self.node_a = node_a
+        self.node_b = node_b
+        self.stiffness = stiffness
+
+        if rest_length is None:
+            dx = node_b.x - node_a.x
+            dy = node_b.y - node_a.y
+            rest_length = np.hypot(dx, dy)
+
+        self.rest_length = rest_length
+
 
 # fill the shape with nodes following a tetrahedral mesh pattern
-vert_spacing = 5
+vert_spacing = 2
 hor_spacing = vert_spacing *  2 / np.sqrt(3)
 
 # define the shape with for loops rather than the shape array
@@ -65,10 +78,12 @@ for row_index, row in enumerate(rows):
 for node in rows[0]:
     node.fixed = True
 
-
 print(f"Number of nodes: {len(nodes)}")
 
+
+
 # plot the nodes
+'''
 plt.figure(figsize=(8, 8))
 for node in nodes:
     for conn in node.connections:
@@ -84,3 +99,251 @@ for node in nodes:
     else:
         plt.plot(node.x, node.y, "bo")
 plt.show()
+'''
+
+
+def assemble_system(nodes, springs, force_scale=1.0):
+    """
+    Assemble the nonlinear internal force vector, external force vector,
+    and tangent stiffness matrix at the current node positions.
+    """
+    node_count = len(nodes)
+    dof_count = 2 * node_count
+
+    node_indices = {node: i for i, node in enumerate(nodes)}
+
+    internal_forces = np.zeros(dof_count)
+    external_forces = np.zeros(dof_count)
+    K = np.zeros((dof_count, dof_count))
+
+    I2 = np.eye(2)
+
+    # Assemble applied nodal forces
+    for i, node in enumerate(nodes):
+        external_forces[2 * i:2 * i + 2] = force_scale * node.F
+
+    # Assemble spring forces and tangent stiffness
+    for spring in springs:
+        i = node_indices[spring.node_a]
+        j = node_indices[spring.node_b]
+
+        xi = np.array([
+            spring.node_a.x,
+            spring.node_a.y
+        ])
+
+        xj = np.array([
+            spring.node_b.x,
+            spring.node_b.y
+        ])
+
+        displacement = xj - xi
+        current_length = np.linalg.norm(displacement)
+
+        if current_length < 1e-12:
+            raise ValueError(
+                f"Spring between nodes {i} and {j} has zero length."
+            )
+
+        direction = displacement / current_length
+
+        k = spring.stiffness
+        rest_length = spring.rest_length
+
+        # Positive when the spring is in tension
+        tension = k * (current_length - rest_length)
+
+        spring_force = tension * direction
+
+        i_slice = slice(2 * i, 2 * i + 2)
+        j_slice = slice(2 * j, 2 * j + 2)
+
+        # Internal energy-gradient forces
+        internal_forces[i_slice] -= spring_force
+        internal_forces[j_slice] += spring_force
+
+        direction_matrix = np.outer(direction, direction)
+
+        # Tangent stiffness:
+        # axial stiffness + geometric stiffness
+        A = (
+            k * direction_matrix
+            + (tension / current_length)
+            * (I2 - direction_matrix)
+        )
+
+        K[i_slice, i_slice] += A
+        K[i_slice, j_slice] -= A
+        K[j_slice, i_slice] -= A
+        K[j_slice, j_slice] += A
+
+    return K, internal_forces, external_forces
+
+
+def solve_single_step(nodes, springs, force_scale=1.0, relaxation=1.0, max_node_displacement=None):
+    """
+    Perform exactly one linearised Newton step.
+
+    This function does not iterate to equilibrium and does not change the
+    applied-force scale. The caller controls both of those operations.
+
+    Returns a dictionary containing convergence information.
+    """
+    K, internal_forces, external_forces = assemble_system(
+        nodes,
+        springs,
+        force_scale
+    )
+
+    residual = external_forces - internal_forces
+
+    fixed_dofs = []
+    free_dofs = []
+
+    for i, node in enumerate(nodes):
+        node_dofs = [2 * i, 2 * i + 1]
+
+        if node.fixed:
+            fixed_dofs.extend(node_dofs)
+        else:
+            free_dofs.extend(node_dofs)
+
+    fixed_dofs = np.asarray(fixed_dofs, dtype=int)
+    free_dofs = np.asarray(free_dofs, dtype=int)
+
+    if len(free_dofs) == 0:
+        return {
+            "residual_norm": 0.0,
+            "displacement_norm": 0.0,
+            "maximum_node_displacement": 0.0,
+            "converged": True,
+        }
+
+    K_free = K[np.ix_(free_dofs, free_dofs)]
+    residual_free = residual[free_dofs]
+
+    try:
+        delta_free = np.linalg.solve(K_free, residual_free)
+    except np.linalg.LinAlgError as error:
+        raise RuntimeError(
+            "The stiffness matrix is singular. The mesh may contain an "
+            "unconstrained rigid-body motion or a shear/floppy mode."
+        ) from error
+
+    delta_free *= relaxation
+
+    delta = np.zeros(2 * len(nodes))
+    delta[free_dofs] = delta_free
+    delta = delta.reshape((-1, 2))
+
+    maximum_displacement = np.max(
+        np.linalg.norm(delta, axis=1)
+    )
+
+    # Optional protection against an excessively large Newton step
+    if (
+        max_node_displacement is not None
+        and maximum_displacement > max_node_displacement
+    ):
+        reduction = max_node_displacement / maximum_displacement
+        delta *= reduction
+        delta_free *= reduction
+        maximum_displacement = max_node_displacement
+
+    # Update free-node positions
+    for i, node in enumerate(nodes):
+        if not node.fixed:
+            node.x += delta[i, 0]
+            node.y += delta[i, 1]
+
+    residual_norm = np.linalg.norm(residual_free)
+    force_norm = np.linalg.norm(external_forces[free_dofs])
+
+    # Relative residual, with protection for zero applied force
+    relative_residual = residual_norm / max(force_norm, 1.0)
+
+    return {
+        "residual_norm": residual_norm,
+        "relative_residual": relative_residual,
+        "displacement_norm": np.linalg.norm(delta_free),
+        "maximum_node_displacement": maximum_displacement,
+        "converged": relative_residual < 1e-8,
+    }
+
+
+
+# Create springs from the initial undeformed geometry
+spring_stiffness = 5.0
+
+springs = [
+    Spring(node, connected_node, spring_stiffness)
+    for node in nodes
+    for connected_node in node.connections
+]
+
+# Save original positions for plotting
+original_positions = {
+    node: np.array([node.x, node.y])
+    for node in nodes
+}
+
+# Gradually apply the node.F loads
+number_of_load_steps = 20
+
+for load_step in range(1, number_of_load_steps + 1 , 5):
+    force_scale = load_step / number_of_load_steps
+
+    for iteration in range(20):
+        result = solve_single_step(
+            nodes,
+            springs,
+            force_scale=force_scale,
+            relaxation=0.5,
+            max_node_displacement=0.5,
+        )
+
+        if (result["relative_residual"] < 1e-7 and result["maximum_node_displacement"] < 1e-7):
+            print(f"Converged at load step {load_step}, iteration {iteration + 1}")
+            break
+
+    print(
+        f"Load {force_scale:.2f}: "
+        f"iterations={iteration + 1}, "
+        f"residual={result['relative_residual']:.3e}"
+    )
+
+
+plt.figure(figsize=(8, 8))
+
+# Original mesh
+for spring in springs:
+    a = original_positions[spring.node_a]
+    b = original_positions[spring.node_b]
+
+    plt.plot(
+        [a[0], b[0]],
+        [a[1], b[1]],
+        color="0.8",
+        linewidth=1,
+        linestyle="--",
+    )
+
+# Deformed mesh
+for spring in springs:
+    plt.plot(
+        [spring.node_a.x, spring.node_b.x],
+        [spring.node_a.y, spring.node_b.y],
+        "k-",
+        linewidth=1,
+    )
+
+for node in nodes:
+    colour = "red" if node.fixed else "blue"
+    plt.plot(node.x, node.y, "o", color=colour)
+
+plt.axis("equal")
+plt.xlabel("x")
+plt.ylabel("y")
+plt.show()
+
+
