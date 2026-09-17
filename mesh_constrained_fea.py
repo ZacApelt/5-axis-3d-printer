@@ -281,42 +281,6 @@ def solve_single_step(nodes, springs, force_scale=1.0, relaxation=1.0, max_node_
 def ammend_nodes(nodes):
     original_node_set = set(nodes)
 
-    def orientation(first, second, third):
-        return (
-            (second.x - first.x) * (third.y - first.y)
-            - (second.y - first.y) * (third.x - first.x)
-        )
-
-    def segments_cross(first, second, third, fourth):
-        first_orientation = orientation(first, second, third)
-        second_orientation = orientation(first, second, fourth)
-        third_orientation = orientation(third, fourth, first)
-        fourth_orientation = orientation(third, fourth, second)
-        epsilon = 1e-9
-
-        return (
-            first_orientation * second_orientation < -epsilon
-            and third_orientation * fourth_orientation < -epsilon
-        )
-
-    def connection_crosses(first, second, all_nodes):
-        for third in all_nodes:
-            for fourth in third.connections:
-                if third in (first, second) or fourth in (first, second):
-                    continue
-                if segments_cross(first, second, third, fourth):
-                    return True
-        return False
-
-    def connect(first, second):
-        if first is second or connection_crosses(first, second, nodes):
-            return False
-        if second not in first.connections:
-            first.connections.append(second)
-        if first not in second.connections:
-            second.connections.append(first)
-        return True
-
     # Use a snapshot because connections are extended while new nodes are added.
     edge_nodes = [node for node in nodes if len(node.connections) < 6]
 
@@ -339,38 +303,38 @@ def ammend_nodes(nodes):
 
         midpoint = (n_a + n_b) / 2
         normal = np.array([-ab[1], ab[0]]) / length
-        candidate_height = np.sqrt(max(0.0, hor_spacing**2 - (length / 2) ** 2))
-        candidate_points = (
-            midpoint + candidate_height * normal,
-            midpoint - candidate_height * normal,
-        )
+        height = np.sqrt(max(0.0, hor_spacing**2 - (length / 2) ** 2))
+        node_d = midpoint + height * normal
 
-        for node_d in candidate_points:
-            if not is_in_geometry(node_d[0], node_d[1]):
-                continue
+        for existing_node in nodes:
+            existing_position = np.array([existing_node.x, existing_node.y])
+            if np.linalg.norm(node_d - existing_position) < hor_spacing / 2:
+                break
+        else:
+            if is_in_geometry(node_d[0], node_d[1]):
+                new_node = Node(node_d[0], node_d[1])
+                nodes.append(new_node)
 
-            too_close = any(
-                np.linalg.norm(node_d - np.array([existing.x, existing.y]))
-                < hor_spacing * 0.35
-                for existing in nodes
-            )
-            if too_close:
-                continue
+                def connect(first, second):
+                    if first is second:
+                        return
+                    if second not in first.connections:
+                        first.connections.append(second)
+                    if first not in second.connections:
+                        second.connections.append(first)
 
-            new_node = Node(node_d[0], node_d[1])
-            nodes.append(new_node)
-            connect(new_node, node_a)
-            connect(new_node, node_b)
+                connect(new_node, node_a)
+                connect(new_node, node_b)
 
-            # Only add local links that are short and do not cross an existing edge.
-            candidate_nodes = set(node_a.connections + node_b.connections)
-            candidate_nodes.discard(new_node)
-            candidate_nodes.discard(node_a)
-            candidate_nodes.discard(node_b)
-            for connected_node in candidate_nodes:
-                connected_position = np.array([connected_node.x, connected_node.y])
-                if np.linalg.norm(node_d - connected_position) <= hor_spacing * 1.1:
-                    connect(new_node, connected_node)
+                # Snapshot the old neighbors so the new node cannot connect to itself.
+                candidate_nodes = set(node_a.connections + node_b.connections)
+                candidate_nodes.discard(new_node)
+                candidate_nodes.discard(node_a)
+                candidate_nodes.discard(node_b)
+                for connected_node in candidate_nodes:
+                    connected_position = np.array([connected_node.x, connected_node.y])
+                    if np.linalg.norm(node_d - connected_position) < hor_spacing * 1.5:
+                        connect(new_node, connected_node)
 
     # remove nodes that are outside the boundary of the original shape
     nodes_to_remove = {
