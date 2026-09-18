@@ -1,27 +1,26 @@
+from attr import dataclass
 import numpy as np
 import trimesh
 import matplotlib.pyplot as plt
 import heapq
 from itertools import product
+from scipy.spatial import cKDTree
 
+print("Loading STL...")
+mesh = trimesh.load_mesh("5-axis-3d-printer\\stl\\branches.stl")
 
-mesh = trimesh.load_mesh("5-axis-3d-printer\\stl\\benchy.stl")
-
-print("stl loaded")
-
+print("voxelising...")
 voxel_size = 0.5
 voxel_mesh = mesh.voxelized(pitch=voxel_size)
 
+print("filling...")
 # fill the interior of the mesh to get a solid voxel representation
 voxel_mesh.fill()
 
-print("voxelised")
 
 voxel_matrix = voxel_mesh.matrix.astype(np.uint8)
 print(f"total number of voxels: {np.sum(voxel_matrix)}")
 print(f"voxel matrix shape: {voxel_matrix.shape}")
-
-
 
 
 def voxel_distances(voxel_matrix, pitch=1.0, seed_mask=None):
@@ -166,31 +165,139 @@ def voxel_distances(voxel_matrix, pitch=1.0, seed_mask=None):
 
     return distances
 
-
+print("calculating distances...")
 distance_matrix = voxel_distances(voxel_matrix, pitch=voxel_size)
 
 # set all inf values to -1
 distance_matrix[distance_matrix == np.inf] = -1
 
-slice_thickenss = 2
-for i in np.arange(0, distance_matrix.max(), slice_thickenss):
-    # search the distance matrix for i < distance < i + slice_thickenss
-    slice_mask = (distance_matrix >= i) & (distance_matrix < i + slice_thickenss)
-    # plot a 3d scatter of the slice
-    fig = plt.figure()
-    ax = fig.add_subplot(111, projection='3d')
-    ax.scatter(*np.where(slice_mask), c='b', marker='o', s=1)
-    ax.set_title(f"Distance slice: {i} to {i + slice_thickenss}")
-    # set the axes limits to the voxel matrix shape
-    ax.set_xlim(0, voxel_matrix.shape[0])
-    ax.set_ylim(0, voxel_matrix.shape[1])
-    ax.set_zlim(0, voxel_matrix.shape[2])
-    plt.show()
+def split_regions(intersection_points, threshold):
+    """Return a list of regions, each containing a list of 3D points."""
+    points = np.asarray(intersection_points, dtype=float)
 
+    if points.size == 0:
+        return []
 
+    tree = cKDTree(points)
+    visited = np.zeros(len(points), dtype=bool)
+    regions = []
 
+    for start in range(len(points)):
+        if visited[start]:
+            continue
 
+        visited[start] = True
+        pending = [start]
+        indices = []
 
-# display the voxelised mesh
-# scene = trimesh.Scene(voxel_mesh)
-# scene.show()
+        while pending:
+            current = pending.pop()
+            indices.append(current)
+
+            for neighbour in tree.query_ball_point(points[current], threshold):
+                if not visited[neighbour]:
+                    visited[neighbour] = True
+                    pending.append(neighbour)
+
+        regions.append(points[indices].tolist())
+
+    return regions
+
+dist_step = 1
+slice_contours = []
+for dist in np.arange(0, distance_matrix.max(), dist_step):
+
+    print(f"finding slice contour for distance {dist},  {dist / distance_matrix.max() * 100:.2f}%...")
+    # go through every edge between occupied voxels and find edges where one voxel has distance < dist and the other voxel has distance > dist
+    # avoid duplicated edges
+    edges_containing_dist = set()
+    nx, ny, nz = distance_matrix.shape
+
+    for i in range(nx):
+        for j in range(ny):
+            for k in range(nz):
+                d1 = distance_matrix[i, j, k]
+                # Ignore empty or unreachable voxels.
+                if not voxel_matrix[i, j, k] or not np.isfinite(d1) or d1 < 0:
+                    continue
+                # Positive directions visit each edge exactly once.
+                for di, dj, dk in [(1, 0, 0), (0, 1, 0), (0, 0, 1)]:
+                    ni, nj, nk = i + di, j + dj, k + dk
+                    if ni >= nx or nj >= ny or nk >= nz:
+                        continue
+                    d2 = distance_matrix[ni, nj, nk]
+                    if (not voxel_matrix[ni, nj, nk] or not np.isfinite(d2) or d2 < 0):
+                        continue
+                    # Accept increasing or decreasing distances.
+                    # Equal endpoint values do not define a unique crossing.
+                    if d1 != d2 and min(d1, d2) <= dist <= max(d1, d2):
+                        edges_containing_dist.add(((i, j, k), (ni, nj, nk)))
+
+    # find the coordinate along the edge where the distance == dist
+    intersection_points = []
+    for (i1, j1, k1), (i2, j2, k2) in edges_containing_dist:
+        d1 = distance_matrix[i1, j1, k1]
+        d2 = distance_matrix[i2, j2, k2]
+        t = (dist - d1) / (d2 - d1)
+        intersection_point = (
+            i1 + t * (i2 - i1),
+            j1 + t * (j2 - j1),
+            k1 + t * (k2 - k1)
+        )
+        intersection_points.append(intersection_point)
+
+    # split disconected regions of intersection points into separate lists for plotting
+    print("splitting disconnected regions...")
+    disconnected_regions = split_regions(
+        intersection_points,
+        threshold=3.0,
+    )
+
+    slice_contours.append(disconnected_regions)
+
+print("plotting...")
+# plot a 3d surface plot of the intersection points
+fig = plt.figure()
+ax = fig.add_subplot(111, projection='3d')
+import matplotlib.tri as mtri
+
+max_triangle_edge = 3.0  # Voxel-index units, like your splitting threshold
+
+for layer_regions in slice_contours:
+    for region in layer_regions:
+        points = np.unique(np.asarray(region, dtype=float), axis=0)
+        if len(points) < 3:
+            continue
+        try:
+            triangulation = mtri.Triangulation(points[:, 0], points[:, 1])
+        except (RuntimeError, ValueError):
+            # XY projection may be degenerate for a vertical patch.
+            ax.scatter(*points.T, s=1)
+            continue
+        triangles = points[triangulation.triangles]
+        # Three physical edge lengths for every proposed triangle.
+        edge_lengths = np.linalg.norm(triangles - np.roll(triangles, -1, axis=1), axis=2)
+
+        reject = np.any(edge_lengths > max_triangle_edge, axis=1)
+
+        if np.all(reject):
+            ax.scatter(*points.T, s=1)
+            continue
+
+        triangulation.set_mask(reject)
+
+        ax.plot_trisurf(
+            triangulation,
+            points[:, 2],
+            linewidth=0.2,
+            antialiased=True,
+            alpha=1.0,
+        )
+ax.set_title(f"Distance slice: {dist} to {dist + dist_step}")
+# set the axes limits to the voxel matrix shape
+ax.set_xlim(0, distance_matrix.shape[0])
+ax.set_ylim(0, distance_matrix.shape[1])
+ax.set_zlim(0, distance_matrix.shape[2])
+# set aspect ratio to be equal
+ax.set_box_aspect([1, 1, 1])
+plt.show()
