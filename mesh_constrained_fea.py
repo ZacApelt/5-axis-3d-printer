@@ -343,169 +343,502 @@ def connection_would_cross(node_a, node_b, nodes):
 
     return False
 
-def ammend_nodes(nodes):
-    original_node_set = set(nodes)
-    connections_changed = False
+def close_complete_hexagons(nodes, connect):
+    """
+    For every node with exactly six neighbours, sort those neighbours
+    angularly and close any missing edges around the six-node ring.
 
-    def connect(node_a, node_b):
-        nonlocal connections_changed
+    Returns True if at least one connection was added.
+    """
+    changed = False
+    maximum_ring_edge_length = 1.5 * hor_spacing
 
-        if node_a is node_b:
-            return False
-
-        if node_b in node_a.connections:
-            return False
-
-        if connection_would_cross(node_a, node_b, nodes):
-            return False
-
-        node_a.connections.append(node_b)
-        node_b.connections.append(node_a)
-
-        connections_changed = True
-        return True
-
-    # Make the original directed connection lists symmetric.
-    for node in list(nodes):
-        for connected_node in list(node.connections):
-            if node not in connected_node.connections:
-                connected_node.connections.append(node)
-                connections_changed = True
-
-    edge_nodes = {
-        node for node in nodes
-        if len(node.connections) < 6
-    }
-
-    connected_edge_pairs = []
-    seen_pairs = set()
-
-    # Find all pairs of under-connected nodes that are already connected to each other.
-    # This is a more localised search than checking every pair of under-connected nodes.
-    for node in nodes:
-        for connected_node in node.connections:
-            if node is connected_node:
-                continue
-
-            pair_key = frozenset((node, connected_node))
-
-            if pair_key in seen_pairs:
-                continue
-
-            seen_pairs.add(pair_key)
-
-            # Only one endpoint needs to be under-connected. Requiring both
-            # can prevent valid missing triangles from being considered.
-            if node in edge_nodes or connected_node in edge_nodes:
-                connected_edge_pairs.append(
-                    (node, connected_node)
-                )
-
-
-    for node_a, node_b in connected_edge_pairs:
-        #if len(node_a.connections) >= 6 and len(node_b.connections) >= 6:
-        #    continue
-
-        position_a = np.array([node_a.x, node_a.y])
-        position_b = np.array([node_b.x, node_b.y])
-
-        ab = position_b - position_a
-        length = np.linalg.norm(ab)
-
-        if length < 1e-12: # or length > 2 * hor_spacing:
+    for centre_node in list(nodes):
+        if len(centre_node.connections) != 6:
             continue
 
-        midpoint = 0.5 * (position_a + position_b)
-        normal = np.array([-ab[1], ab[0]]) / length
+        centre_position = np.array([
+            centre_node.x,
+            centre_node.y,
+        ])
 
-        triangle_height = np.sqrt(max(0.0, hor_spacing**2 - (length / 2.0)**2))
+        # Connections are not stored in geometric order, so explicitly
+        # sort the six neighbours by their polar angle around the centre.
+        ordered_neighbours = sorted(
+            centre_node.connections,
+            key=lambda neighbour: np.arctan2(
+                neighbour.y - centre_node.y,
+                neighbour.x - centre_node.x,
+            ),
+        )
 
-        candidate_positions = [
-            midpoint + triangle_height * normal,
-            midpoint - triangle_height * normal,
-        ]
+        # Consecutive angular neighbours, including the final-to-first
+        # pair, should form the six edges of the hexagonal ring.
+        for index in range(6):
+            first = ordered_neighbours[index]
+            second = ordered_neighbours[(index + 1) % 6]
 
-        for candidate_position in candidate_positions:
-            if not is_in_geometry(candidate_position[0], candidate_position[1]):
+            if second in first.connections:
                 continue
 
-            # Find the closest existing node to this triangle vertex.
-            closest_node = None
-            closest_distance = np.inf
-
-            for existing_node in nodes:
-                distance = np.linalg.norm(candidate_position - np.array([existing_node.x, existing_node.y]))
-
-                if distance < closest_distance:
-                    closest_distance = distance
-                    closest_node = existing_node
-
-            if closest_distance < hor_spacing / 2:
-                triangle_node = closest_node
-
-            else:
-                # The triangle vertex is vacant.
-                triangle_node = Node(
-                    candidate_position[0],
-                    candidate_position[1],
-                )
-                nodes.append(triangle_node)
-
-            # These are the only connections implied by this triangle.
-            connect(triangle_node, node_a)
-            connect(triangle_node, node_b)
-
-
-    # Remove nodes outside the original geometry.
-    nodes_to_remove = {
-        node for node in nodes
-        if (
-            not node.fixed
-            and not is_in_geometry(node.x, node.y)
-        )
-    }
-
-    if nodes_to_remove:
-        nodes[:] = [
-            node for node in nodes
-            if node not in nodes_to_remove
-        ]
-        connections_changed = True
-
-    remaining_nodes = set(nodes)
-
-    # Remove deleted references, self-links and duplicates.
-    for node in nodes:
-        cleaned_connections = list(dict.fromkeys(
-            connected_node
-            for connected_node in node.connections
-            if (
-                connected_node is not node
-                and connected_node in remaining_nodes
+            distance = np.hypot(
+                second.x - first.x,
+                second.y - first.y,
             )
-        ))
 
-        if cleaned_connections != node.connections:
-            node.connections[:] = cleaned_connections
-            connections_changed = True
+            # A large angular gap may represent a real external boundary,
+            # not a missing hexagon edge.
+            if distance > maximum_ring_edge_length:
+                continue
 
-    # Your existing load assignment.
-    for node in nodes:
-        if (
-            mid_height - vert_spacing
-            <= node.y
-            <= mid_height + vert_spacing
-            and node.x > minor_width
+            if connect(first, second):
+                changed = True
+
+    return changed
+
+def opposite_triangle_candidates(
+    node_a,
+    node_b,
+    candidate_positions,
+):
+    """
+    If A-B already has one triangular face, return only the candidate
+    on the opposite side. If it has no face, return both candidates.
+    If it already has faces on both sides, return no candidates.
+    """
+    position_a = np.array([node_a.x, node_a.y])
+    position_b = np.array([node_b.x, node_b.y])
+    ab = position_b - position_a
+
+    def side_of_edge(position):
+        relative = position - position_a
+
+        return (
+            ab[0] * relative[1]
+            - ab[1] * relative[0]
+        )
+
+    common_neighbours = (
+        set(node_a.connections)
+        & set(node_b.connections)
+    )
+
+    occupied_signs = []
+
+    for common_node in common_neighbours:
+        common_position = np.array([
+            common_node.x,
+            common_node.y,
+        ])
+
+        side = side_of_edge(common_position)
+
+        if side > 1e-9:
+            occupied_signs.append(1)
+        elif side < -1e-9:
+            occupied_signs.append(-1)
+
+    occupied_signs = set(occupied_signs)
+
+    # Existing triangular faces on both sides: the edge is internal and
+    # no further triangle should be created.
+    if occupied_signs == {-1, 1}:
+        return []
+
+    # No existing face: either candidate may represent vacant material.
+    if not occupied_signs:
+        return candidate_positions
+
+    occupied_sign = next(iter(occupied_signs))
+
+    return [
+        candidate_position
+        for candidate_position in candidate_positions
+        if np.sign(side_of_edge(candidate_position))
+        == -occupied_sign
+    ]
+
+
+def ammend_nodes(nodes):
+    L = float(hor_spacing)
+    eps = 1e-9 * L
+    area_eps = eps * L
+    merge_distance = 0.45 * L
+    changed = False
+
+    def position(node):
+        return np.array([node.x, node.y], dtype=float)
+
+    def cross(a, b):
+        return a[0] * b[1] - a[1] * b[0]
+
+    def on_segment(p, a, b):
+        return (
+            abs(cross(b - a, p - a)) <= area_eps
+            and np.dot(p - a, p - b) <= eps**2
+        )
+
+    # Remove outside nodes before deciding where the boundary is.
+    kept = [
+        n for n in nodes
+        if n.fixed or is_in_geometry(n.x, n.y)
+    ]
+    changed |= len(kept) != len(nodes)
+    nodes[:] = kept
+    live = set(nodes)
+
+    # Use sets internally: symmetric, unique connections.
+    adjacency = {n: set() for n in nodes}
+
+    for a in nodes:
+        for b in a.connections:
+            if b in live and b is not a:
+                adjacency[a].add(b)
+                adjacency[b].add(a)
+
+    if any(len(adjacency[n]) > 6 for n in nodes):
+        raise RuntimeError(
+            "The input mesh already has a node with >6 neighbours. "
+            "Restart from the original mesh."
+        )
+
+    def all_edges():
+        seen = set()
+        result = []
+
+        for a in nodes:
+            for b in adjacency[a]:
+                key = frozenset((a, b))
+                if key not in seen:
+                    seen.add(key)
+                    result.append((a, b))
+
+        return result
+
+    def edges_conflict(a, b, c, d):
+        # Identical edge is allowed.
+        if frozenset((a, b)) == frozenset((c, d)):
+            return False
+
+        pa, pb = position(a), position(b)
+        pc, pd = position(c), position(d)
+
+        shared = {a, b} & {c, d}
+
+        if shared:
+            # Shared endpoints are allowed, but overlapping edges are not.
+            joint = next(iter(shared))
+            other_ab = b if a is joint else a
+            other_cd = d if c is joint else c
+            origin = position(joint)
+            u = position(other_ab) - origin
+            v = position(other_cd) - origin
+
+            return (
+                abs(cross(u, v)) <= area_eps
+                and np.dot(u, v) > eps**2
+            )
+
+        s1 = cross(pb - pa, pc - pa)
+        s2 = cross(pb - pa, pd - pa)
+        s3 = cross(pd - pc, pa - pc)
+        s4 = cross(pd - pc, pb - pc)
+
+        def opposite(x, y):
+            return (
+                (x > area_eps and y < -area_eps)
+                or (x < -area_eps and y > area_eps)
+            )
+
+        if opposite(s1, s2) and opposite(s3, s4):
+            return True
+
+        # Also reject touching a non-shared endpoint or collinear overlap.
+        return (
+            on_segment(pc, pa, pb)
+            or on_segment(pd, pa, pb)
+            or on_segment(pa, pc, pd)
+            or on_segment(pb, pc, pd)
+        )
+
+    def inside_polygon(p, polygon):
+        # Boundary counts as occupied.
+        inside = False
+
+        for a, b in zip(polygon, polygon[1:] + polygon[:1]):
+            if on_segment(p, a, b):
+                return True
+
+            if (a[1] > p[1]) != (b[1] > p[1]):
+                x_intersection = (
+                    a[0]
+                    + (p[1] - a[1])
+                    * (b[0] - a[0])
+                    / (b[1] - a[1])
+                )
+                if p[0] < x_intersection:
+                    inside = not inside
+
+        return inside
+
+    def mesh_faces():
+        """
+        Walk directed edges with the face on the left.
+
+        Positive-area walks are bounded cells.
+        Negative-area walks border the exterior.
+        """
+        ordered = {
+            n: sorted(
+                adjacency[n],
+                key=lambda other: np.arctan2(
+                    other.y - n.y, other.x - n.x
+                ),
+            )
+            for n in nodes
+        }
+
+        visited = set()
+        cells = []
+        boundary = []
+
+        for a in nodes:
+            for b in ordered[a]:
+                if (a, b) in visited:
+                    continue
+
+                start = (a, b)
+                edge = start
+                walk = []
+
+                while edge not in visited:
+                    visited.add(edge)
+                    walk.append(edge)
+                    u, v = edge
+
+                    neighbours = ordered[v]
+                    incoming = neighbours.index(u)
+
+                    # Clockwise turn from the reverse incoming edge.
+                    w = neighbours[(incoming - 1) % len(neighbours)]
+                    edge = (v, w)
+
+                if edge != start:
+                    raise RuntimeError("Invalid mesh face traversal.")
+
+                polygon = [position(u) for u, _ in walk]
+                twice_area = sum(
+                    cross(p, q)
+                    for p, q in zip(
+                        polygon, polygon[1:] + polygon[:1]
+                    )
+                )
+
+                if twice_area > area_eps:
+                    cells.append(polygon)
+                elif twice_area < -area_eps:
+                    boundary.extend(walk)
+
+        return cells, boundary
+
+    def segment_in_geometry(a, b):
+        """
+        Exact segment check for your axis-aligned, L-shaped geometry:
+        test between each crossing of a contour coordinate.
+        """
+        p, q = position(a), position(b)
+        delta = q - p
+        parameters = [0.0, 1.0]
+
+        for axis, boundaries in (
+            (0, (0.0, minor_width, major_width)),
+            (1, (0.0, mid_height, height)),
         ):
-            node.F = np.array([0.0, -1.0])
+            if abs(delta[axis]) > eps:
+                for value in boundaries:
+                    t = (value - p[axis]) / delta[axis]
+                    if 0.0 < t < 1.0:
+                        parameters.append(t)
+
+        parameters = sorted(set(parameters))
+        samples = parameters + [
+            0.5 * (t0 + t1)
+            for t0, t1 in zip(parameters, parameters[1:])
+        ]
+
+        return all(
+            is_in_geometry(*(p + t * delta))
+            for t in samples
+        )
+
+    edges = all_edges()
+
+    # Face walking requires an initially planar mesh.
+    for index, (a, b) in enumerate(edges):
+        for c, d in edges[index + 1:]:
+            if edges_conflict(a, b, c, d):
+                raise RuntimeError(
+                    "The input mesh already has crossing/overlapping "
+                    "springs. Restart from the original mesh."
+                )
+
+    cells, boundary = mesh_faces()
+
+    # Snapshot: newly exposed edges are handled by your next amendment pass.
+    seeds = sorted(
+        boundary,
+        key=lambda edge: np.linalg.norm(
+            position(edge[1]) - position(edge[0])
+        ),
+    )
+    exposed = set(boundary)
+
+    for a, b in seeds:
+        # Earlier insertions may already have covered this edge.
+        if (a, b) not in exposed:
+            continue
+
+        pa, pb = position(a), position(b)
+        ab = pb - pa
+        length = np.linalg.norm(ab)
+
+        # Two nominal-length sides cannot span an edge >= 2L.
+        if length <= eps or length >= 2.0 * L - eps:
+            continue
+
+        normal = np.array([-ab[1], ab[0]]) / length
+        altitude = np.sqrt(L**2 - 0.25 * length**2)
+
+        # Exterior face is on the left of this directed boundary edge.
+        target = 0.5 * (pa + pb) + altitude * normal
+
+        # First try reusing a nearby node; otherwise propose a new one.
+        candidates = sorted(
+            (
+                n for n in nodes
+                if n is not a and n is not b
+                and np.linalg.norm(position(n) - target)
+                < merge_distance
+                and cross(ab, position(n) - pa) > area_eps
+            ),
+            key=lambda n: np.linalg.norm(position(n) - target),
+        )
+
+        if (
+            is_in_geometry(*target)
+            and all(
+                np.linalg.norm(position(n) - target) >= merge_distance
+                for n in nodes
+            )
+            and not any(inside_polygon(target, cell) for cell in cells)
+        ):
+            candidates.append(Node(float(target[0]), float(target[1])))
+
+        for c in candidates:
+            pc = position(c)
+            is_new = c not in adjacency
+
+            if cross(ab, pc - pa) <= area_eps:
+                continue
+
+            if not is_in_geometry(*pc):
+                continue
+
+            # A triangle cannot enclose another mesh node, including on
+            # one of its sides. This prevents covering existing material
+            # or adding an edge through an intermediate node.
+            contains_node = False
+
+            for n in nodes:
+                if n is a or n is b or n is c:
+                    continue
+
+                p = position(n)
+                sides = (
+                    cross(pb - pa, p - pa),
+                    cross(pc - pb, p - pb),
+                    cross(pa - pc, p - pc),
+                )
+
+                if min(sides) >= -area_eps:
+                    contains_node = True
+                    break
+
+            if contains_node:
+                continue
+
+            missing = [
+                (u, c) for u in (a, b)
+                if c not in adjacency[u]
+            ]
+            if not missing:
+                continue
+
+            increases = {a: 0, b: 0, c: 0}
+            for u, v in missing:
+                increases[u] += 1
+                increases[v] += 1
+
+            if any(
+                len(adjacency.get(n, ())) + increase > 6
+                for n, increase in increases.items()
+            ):
+                continue
+
+            if any(
+                not segment_in_geometry(u, v)
+                for u, v in missing
+            ):
+                continue
+
+            if any(
+                edges_conflict(u, v, e, f)
+                for u, v in missing
+                for e, f in edges
+            ):
+                continue
+
+            # Accept the entire triangle together.
+            if is_new:
+                nodes.append(c)
+                adjacency[c] = set()
+
+            for u, v in missing:
+                adjacency[u].add(v)
+                adjacency[v].add(u)
+                edges.append((u, v))
+
+            changed = True
+
+            # Recompute occupancy immediately, not next iteration.
+            cells, boundary = mesh_faces()
+            exposed = set(boundary)
+            break
+
+    # Write the authoritative undirected graph back to your Node objects.
+    index = {n: i for i, n in enumerate(nodes)}
+
+    for n in nodes:
+        neighbours = sorted(adjacency[n], key=index.get)
+
+        if (
+            set(n.connections) != adjacency[n]
+            or len(n.connections) != len(neighbours)
+        ):
+            changed = True
+
+        n.connections[:] = neighbours
+
+        # Preserve the load assignment from your latest uploaded script.
+        if (
+            mid_height - vert_spacing <= n.y <= mid_height + vert_spacing
+            and n.x > minor_width
+        ):
+            n.F = np.array([0.0, -1.0])
         else:
-            node.F = np.array([0.0, 0.0])
+            n.F = np.zeros(2)
 
-    nodes_changed = set(nodes) != original_node_set
-
-    # Connection-only changes must cause another amendment pass because those
-    # new edges can reveal further missing triangles.
-    return nodes_changed or connections_changed
+    return changed
 
 
 def build_springs(nodes):
