@@ -22,3 +22,7 @@ Sliced into extrusion paths. No infill patern on this version because that's rea
 Displaying every 5th layer:
 
 ![alt text](image-5.png)
+
+Ideal orientations for each layer:
+
+![alt text](image-6.png)
