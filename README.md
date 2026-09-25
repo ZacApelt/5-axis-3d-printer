@@ -1,5 +1,5 @@
 # 5-axis-3d-printer
-Development a usable 5-axis slicer to improve the strength, model complexity, and surface finish of FDM parts
+Development of a usable 5-axis slicer to improve the strength, model complexity, and surface finish of FDM parts
 
 ## Current progress
 
@@ -16,3 +16,9 @@ And then 5-axis slice profile generation using a wavefront propagating from the 
 ![alt text](image-3.png)
 
 ![alt text](image-4.png)
+
+
+Sliced into extrusion paths. No infill patern on this version because that's really hard. Everything is sliced with 100% infill and concentric walls. If you're doing 5-axis, you want strength, so this can kind of be justified.
+Displaying every 5th layer:
+
+![alt text](image-5.png)
